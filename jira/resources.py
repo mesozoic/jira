@@ -3,6 +3,7 @@
 This module implements the Resource classes that translate JSON from Jira REST
 resources into usable objects.
 """
+
 from __future__ import annotations
 
 import json
@@ -736,6 +737,14 @@ class Issue(Resource):
             deleteSubtasks (bool): True to also delete subtasks. If any are present the Issue won't be deleted (Default: ``True``)
         """
         super().delete(params={"deleteSubtasks": deleteSubtasks})
+
+    def archive(self, notify: bool = True) -> None:
+        """Archive this issue.
+
+        Args:
+            notify (bool): send an email notification that the issue was updated to users that watch it (Default: ``True``)
+        """
+        self._session.put(self.self + "/archive", params={"notifyUsers": notify})
 
     def permalink(self):
         """Get the URL of the issue, the browsable one not the REST one.

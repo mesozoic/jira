@@ -11,13 +11,20 @@ import sys
 import time
 import unittest
 import weakref
+from contextlib import ExitStack
+from datetime import datetime, timezone
+from functools import partialmethod
 from time import sleep
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
+import requests_mock
+import requests_mock.adapter
+from typing_extensions import Self
 
 from jira import JIRA
 from jira.exceptions import JIRAError
+from jira.resources import Issue
 
 TEST_ROOT = os.path.dirname(__file__)
 TEST_ICON_PATH = os.path.join(TEST_ROOT, "icon.png")
@@ -363,3 +370,117 @@ def no_fields(monkeypatch):
     We don't need the features of a MagicMock, hence we don't use it here.
     """
     monkeypatch.setattr(JIRA, "fields", lambda *args, **kwargs: [])
+
+
+class MockJira:
+    client: JIRA
+    mocker: requests_mock.Mocker
+
+    def __init__(self, version: str = "9.16.0"):
+        self._context_stack = ExitStack()
+        self._server = os.environ.get("CI_JIRA_URL", "http://localhost/jira")
+        self._server_version = version
+        self._auth = (
+            os.environ.get("CI_JIRA_USER", "user"),
+            os.environ.get("CI_JIRA_USER_PASSWORD", "password"),
+        )
+        self._issues: dict[str, dict[str, Any]] = {}  # by key
+        self.mocker = requests_mock.Mocker()
+
+    def __enter__(self) -> Self:
+        self.mocker.__enter__()
+        self._configure()
+        return self
+
+    def __exit__(self, type: Any, value: Any, traceback: Any) -> None:
+        self.mocker.__exit__(type, value, traceback)
+
+    def _configure(self) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        # can't use self.client._get_url because it's not created yet
+        server_info_url = JIRA.JIRA_BASE_URL.format(
+            server=self._server,
+            rest_path=JIRA.DEFAULT_OPTIONS["rest_path"],
+            rest_api_version=JIRA.DEFAULT_OPTIONS["rest_api_version"],
+            path="serverInfo",
+        )
+        self.get(
+            server_info_url,
+            json={
+                "baseUrl": self._server,
+                "version": self._server_version,
+                "versionNumbers": [int(n) for n in self._server_version.split(".")],
+                "buildNumber": 1,
+                "buildDate": now,
+                "serverTime": now,
+                "serverTitle": "MockJira",
+            },
+        )
+        self.client = JIRA(self._server, basic_auth=self._auth)
+
+    def issue(self, key: str = "", **fields: Any) -> Issue:
+        """
+        Registers GET responses for an issue key.
+        """
+        key = key or "CI-1"
+        self_id = str(id(key))
+        issue_json = self._issues[key] = {
+            "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
+            "id": self_id,
+            "self": self.client._get_url(f"issue/{self_id}"),
+            "key": key,
+            "fields": fields,
+        }
+        self.get(f"issue/{key}", json=issue_json)
+        self.get(f"issue/{self_id}", json=issue_json)
+        return self.client.issue(key)
+
+    def register_request(
+        self,
+        method: str,
+        url: str | re.Pattern,
+        *args: Any,
+        **kwargs: Any,
+    ) -> requests_mock.adapter._Matcher:
+        """
+        Wrapper around request_mock's Matcher interface which adds some Jira-specific behavior.
+        """
+
+        # shortcut to allow e.g. mock_jira.post("whatever") without specifying the full URL
+        if isinstance(url, str) and not url.startswith("http"):
+            url = self.client._get_url(
+                url,
+                base=(
+                    self.client.AGILE_BASE_URL
+                    if kwargs.pop("agile", None)
+                    else self.client.JIRA_BASE_URL
+                ),
+            )
+
+        # Any time a test mocks the URL for an issue, we need to ensure
+        # that our mock request matchers catch both issue key *and* issue ID.
+        if isinstance(url, str) and (
+            match := re.search(r"issue/([A-Z][A-Z0-9]+-[1-9][0-9]*)\b", url)
+        ):
+            # Only do this if we recognize the issue key as one we've mocked.
+            if issue_id := self._issues.get((issue_key := match[1]), {}).get("id"):
+                alt_url = url.replace(f"/issue/{issue_key}", f"/issue/{issue_id}")
+                url = re.compile(f"^({re.escape(url)}|{re.escape(alt_url)})$")
+
+        return self.mocker.request(method, url, *args, **kwargs)
+
+    get = partialmethod(register_request, "GET")
+    post = partialmethod(register_request, "POST")
+    patch = partialmethod(register_request, "PATCH")
+    put = partialmethod(register_request, "PUT")
+    delete = partialmethod(register_request, "DELETE")
+
+
+@pytest.fixture
+def mock_jira(requests_mock) -> Iterator[MockJira]:
+    """
+    Fixture that intercepts network traffic to Jira and allows tests to define
+    how the mocked network responses will behave.
+    """
+    with MockJira() as m:
+        yield m

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from jira.exceptions import JIRAError
 from tests.conftest import JiraTestCase, find_by_key, find_by_key_value
 
@@ -545,3 +547,19 @@ class IssueTests(JiraTestCase):
         self.jira.rank(self.issue_2, prev_issue=self.issue_1)
         issues = get_issues_ordered_by_rank()
         assert (issues[0].key, issues[1].key) == (self.issue_1, self.issue_2)
+
+
+@pytest.mark.parametrize(
+    "kwargs,expect_notify",
+    [
+        ({}, True),
+        ({"notify": False}, False),
+        ({"notify": True}, True),
+    ],
+)
+def test_archive(mock_jira, kwargs, expect_notify):
+    issue = mock_jira.issue()
+    path = f"issue/{issue.key}/archive?notifyUsers={expect_notify}"
+    m = mock_jira.put(path, text="", status_code=204)
+    issue.archive(**kwargs)
+    assert m.called
